@@ -13,7 +13,7 @@ Tested on RHEL 6 (need reboot + replay) and RHEL 7 / VCenter 6 and 6.5
 
 ## Role Variables
 ```
-vg_destination: data_vg
+vg_destination: bigdatavg
 extension_requise_go: 10
 - controleurs:
       - vim.vm.device.ParaVirtualSCSIController
