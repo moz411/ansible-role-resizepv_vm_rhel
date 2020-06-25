@@ -1,0 +1,20 @@
+---
+
+#
+# meta
+#
+
+galaxy_info:
+  role_name: role-resizepv_vm_rhel
+  author: Thomas DUPOUY <moz@free.fr>
+  description: Ce role permet d'augmenter la taille d'un PV sur une VM RHEL6 / RHEL7
+  license: N/C
+  min_ansible_version: 2.9
+  platforms:
+   - name: RedHat
+     versions:
+     - 6.*
+     - 7.*
+  galaxy_tags: []
+
+dependencies: []

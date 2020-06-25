@@ -1,0 +1,166 @@
+---
+
+- name: "Définition de l'extension requise en bytes"
+  set_fact:
+    extension_requise_bytes: "{{ extension_requise_go*1024|pow(3)|int }}"
+
+- name: "Vérification de la version d'OS"
+  assert:
+    that:
+      - ansible_distribution_file_variety == "RedHat"
+      - ansible_distribution_version|float >= 6
+
+- name: "Identification de l'espace disponible"
+  set_fact:
+    free_g: "{{ item.value.free_g }}"
+  when: item.key == vg_destination
+  loop: "{{ ansible_lvm.vgs|dict2items }}"
+
+- name: "Installation du package cloud-utils-growpart"
+  shell: yum install -y cloud-utils-growpart
+  args:
+    warn: no
+  check_mode: no
+  changed_when: false
+
+- name: "Récupération des informations sur les disques de la VM"
+  become: no
+  vmware_guest_disk_info:
+    hostname: "{{ vcenter_hostname }}"
+    username: "{{ vmware_username }}"
+    password: "{{ vmware_password }}"
+    validate_certs: no
+    datacenter: "{{ datacenter }}"
+    name: "{{ vm_name }}"
+    folder: "{{ vm_folder }}"
+  delegate_to: localhost
+  register: vm
+
+- name: "Identification du disque contenant le vg à traiter"
+  set_fact:
+    disque: "{{ item.key[:-1] }}"
+    disque_dev: "{{ item.key[:-1].split('/')[-1] }}"
+    partition: "{{ item.key[-1] }}"
+    taille_pv_bytes: "{{ item.value.size_g|int*1024|pow(3) }}"
+  when: item.value.vg == vg_destination
+  loop: "{{ ansible_lvm.pvs|dict2items }}"
+
+- name: "Vérification que le disque contient une seule partition"
+  assert:
+    that:
+      - ansible_devices.{{ disque_dev  }}.partitions|list|length|int == 1
+
+- name: "Liste des H:C:T:L du host"
+  command: lsscsi
+  register: lsscsi
+  check_mode: no
+  changed_when: false
+
+- name: "Identification du H:C:T:L du disque contenant le vg à traiter"
+  set_fact:
+    hctl: "{{ item.split()[0][1:-1].split(':')|map('int')|list }}"
+  when: item.split()[-1] == disque
+  with_items:
+    - "{{ lsscsi.stdout_lines }}"
+
+- name: "Identification du disque de la VM"
+  set_fact:
+    backing_datastore: "{{ vm.guest_disk_info[item|quote].backing_datastore }}"
+    backing_filename: "{{ vm.guest_disk_info[item|quote].backing_filename }}"
+    taille_disque_bytes: "{{ vm.guest_disk_info[item|quote].capacity_in_bytes }}"
+  when:
+    - vm.guest_disk_info[item|quote].controller_bus_number == hctl[1]
+    - vm.guest_disk_info[item|quote].unit_number == hctl[2]
+  loop: "{{ vm.guest_disk_info.keys() | list }}"
+
+- name: "Définition de la taille requise en bytes et ko"
+  set_fact:
+    taille_requise_bytes: "{{ taille_disque_bytes|int + extension_requise_bytes|int }}"
+    taille_requise_ko: "{{ (taille_disque_bytes|int + extension_requise_bytes|int)/1024 }}"
+
+- name: "Vérification de la nécessité d'agrandir le disque"
+  set_fact:
+    taille_requise_bytes: "{{ taille_disque_bytes|int }}"
+    taille_requise_ko: "{{ (taille_disque_bytes|int)/1024 }}"
+  when: (taille_disque_bytes|int - taille_pv_bytes|int >= extension_requise_bytes|int) or
+        (free_g|float > extension_requise_go|float)
+
+- debug:
+    msg:
+      - "Disque : {{ disque }}"
+      - "Partition : {{ partition }}"
+      - "HCTL : {{ hctl }}"
+      - "Espace libre dans {{ vg_destination }} : {{ free_g }} Go"
+      - "Taille disque : {{ taille_disque_bytes|int/1024|pow(3) }} Go"
+      - "Taille requise : {{ taille_requise_bytes|int/1024|pow(3) }} Go"
+      - "backing_datastore : {{ backing_datastore }}"
+      - "backing_filename : {{ backing_filename }}"
+
+- name: "Sortie si espace suffisant dans le vg et/ou check_mode"
+  meta: end_host
+  when: (free_g|float > extension_requise_go|float) or ansible_check_mode
+
+- name: "Extension du disque sur le datastore"
+  become: no
+  delegate_to: "localhost"
+  vmware_guest_disk:
+    hostname: "{{ vcenter_hostname }}"
+    username: "{{ vmware_username }}"
+    password: "{{ vmware_password }}"
+    validate_certs: no
+    datacenter: "{{ datacenter }}"
+    name: "{{ vm_name }}"
+    folder: "{{ vm_folder }}"
+    disk:
+      - datastore: "{{ backing_datastore }}"
+        filename: "{{ backing_filename }}"
+        scsi_controller: "{{ hctl[1] }}"
+        unit_number: "{{ hctl[2] }}"
+        size_kb: "{{ taille_requise_ko|int }}"
+
+- name: "Détection de la nouvelle volumétrie"
+  shell: echo '1' > /sys/class/block/{{ disque_dev }}/device/rescan
+  changed_when: false
+
+- name: "Attente de la detection de la volumétrie"
+  shell: /sbin/blockdev --getsize64 {{ disque }}
+  register: blockdev
+  until: blockdev.stdout == taille_requise_bytes
+  retries: 3
+  delay: 10
+  changed_when: false
+
+- name: "Agrandissement de la partition"
+  shell: growpart {{ disque }} {{ partition }}
+  ignore_errors: yes
+  changed_when: true
+
+- name: "Mise à jour de la table de partition en mémoire"
+  shell: partprobe {{ disque }}
+  ignore_errors: yes
+  changed_when: true
+
+- name: "Agrandissement du pv"
+  shell: pvresize {{ disque + partition }}
+  register: pvresize
+  changed_when: true
+
+- name: "Rafraîchissement des informations système"
+  setup:
+    gather_subset:
+      - hardware
+
+- name: "Identification de l'espace disponible"
+  set_fact:
+    free_g: "{{ item.value.free_g }}"
+  when: item.key == vg_destination
+  loop: "{{ ansible_lvm.vgs|dict2items }}"
+
+- name: "Affichage de l'espace restant"
+  debug:
+    msg: "{{ free_g  }} Go libres"
+
+- name: "Vérification de la mise à jour du pv"
+  assert:
+    that:
+      - free_g|float > extension_requise_go|float

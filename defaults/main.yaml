@@ -1,0 +1,6 @@
+---
+vg_destination: bigdatavg
+extension_requise_go: 10
+controleurs:
+  - vim.vm.device.ParaVirtualSCSIController
+  - vim.vm.device.VirtualLsiLogicController
